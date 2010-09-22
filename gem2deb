@@ -1,96 +1,233 @@
 #!/bin/bash
-# vim: ts=4 expandtab
 
-DEBEMAIL="Your Name <youremail@example.com>"
+#############################################
+#                GLOBALS                    #
+#############################################
+
+DEBEMAIL="Lolek Bolek <lolek.bolek@example.com>"
 RELEASE="1rel"
+
+DEB_DIR="/tmp"
+
+#############################################
+#                FUNCTIONS                  #
+#############################################
+
+MYNAME=$(basename "$0")
+VERSION="0.11"
+Error=""
+WORKDIR=""
+TO_CLEANUP=""
+NO_CLEANUP="0"
+FORCE=0
 DISTRO=$( lsb_release -c -s )
+VERBOSE=0
+DO_DEPENDENCIES="0"
 
-base=$( dirname "$0" )
-gem2debdir=$( cd "$base" ; pwd )
-# from 
-# http://blog.loftninjas.org/?p=248
+# fix path
+MYDIR=$(readlink -f "$0")
+MYDIR=$(dirname "${MYDIR}")
+PATH="$PATH:${MYDIR}"
+export PATH
 
-if [ $# -le 0 ]; then
-    echo "Usage: $0 <file .gem or .tar.gz>  [ <package name> ]" >&2
-    echo "Generate a .deb package from a ruby .gem (or gem as .tar.gz)" >&2
-    exit 1
-fi
+die() {
+	# perform cleanup
+	do_cleanup
+	msg_fatal "$@"
+}
 
-filename="$1"
+msg_verbose() {
+	test "${VERBOSE}" = "1" || return 0
+	echo "VERBOSE: $@"
+}
 
-set -x
-set -e
+msg_fatal() {
+	echo "ERROR:   $@"
+	exit 1
+}
 
-origpath=$( pwd )
-#trap "cd '$origpath' && test -d '$WORKDIR' && rm -rf '$WORKDIR'" EXIT
+msg_info() {
+	echo "INFO:    $@"
+}
 
-if [ -z "$WORKDIR" ]; then
-  WORKDIR=$( mktemp -t -d gm2db.XXXXXXXXXX )
-else
-  mkdir $WORKDIR
-fi
+do_cleanup() {
+	test "${NO_CLEANUP}" = "1" && return 0
 
-if [ $? -ne 0 -o ! -d "$WORKDIR" ]; then
-    echo "$0: unable to create temporary directory" >&2
-    exit 1
-fi
+	local e=""
+	msg_verbose "Cleaning up."
+	for e in ${TO_CLEANUP}; do
+		if [ ! -z "${e}" -a -d "${e}" -a "${e}" != "/" -a "${e}" != "/root" ]; then
+			msg_verbose "  Removing: ${e}"
+			rm -rf "${e}"
+		fi
+	done
+}
 
-suffix=$( echo "$1" | tail -c4 )
-if [ "$suffix" = "gem" ]; then
-    cp $filename $WORKDIR
-    cd $WORKDIR
-    filename=$(basename "$filename")
-    gem unpack "$filename"
-    basedir=$(basename "$filename" .gem)
-else
-    cd $WORKDIR
-    filename=$( gem fetch "$1" | awk '{print $2}' )
-    filename="$filename.gem"
-    gem unpack "$filename"
-    basedir=$(basename "$filename" .gem)
-fi
-
-
-GEM_DEPENDENCIES=$( $gem2debdir/gemdeps.rb $filename )
-
-cd "$basedir"
-cp /usr/lib/ruby/1.8/setup.rb .
-mkdir debian
-BD=$( pwd )
-VERSION=$( basename $BD | perl -pe 's/^.+-([\d.]+)$/$1/;' )
-PACKAGE=$( basename $BD | perl -pe 's/^(.+)-[\d.]+$/$1/;' )
-gemname=$PACKAGE
+to_cleanup_add() {
+	if [ -z "${TO_CLEANUP}" ]; then
+		TO_CLEANUP="${1}"
+	else
+		TO_CLEANUP="${TO_CLEANUP} ${1}"
+	fi
+}
 
 
-if [ -d ext ]; then
-    ARCHITECTURE=any
-else
-    ARCHITECTURE=all
-fi
+script_init() {
+	# check destination
+	test -d "${DEB_DIR}" -a -w "${DEB_DIR}" || die "Invalid debian package directory: '${DEB_DIR}'."
 
-# we don't want to edit the changelog file after generation
-# so make /usr/bin/sensible-editor attempt to use /bin/true as the editor
-EDITOR=/bin/true
-VISUAL=/bin/true
-export EDITOR VISUAL
+	# create temporary directory
+	local tmpd=$(mktemp -t -d "${MYNAME}.XXXXXXXXXX")
+	test -z "${tmpd}" -o ! -d "${tmpd}" -o ! -w "${tmpd}" && die "Unable to create temporary directory."
 
-if [ -z "$2" ]; then
-    pk=$( echo $gemname | tr '_' '-' )
-    PACKAGE="lib$pk-ruby"
-else
-    PACKAGE="$2"
-fi
+	# assign workdir
+	WORKDIR="${tmpd}"
+	msg_verbose "Created temporary directory: ${tmpd}"
 
-if [ -z $DEPENDENCIES ]; then
-    DEPLIST="$GEM_DEPENDENCIES"
-else
-    DEPLIST="$GEM_DEPENDENCIES, $DEPENDENCIES"
-fi
+	# this directory should be cleaned up
+	to_cleanup_add "${tmpd}"
+}
 
-dch --create "-v$VERSION" -D $DISTRO --package "$PACKAGE" 'initial release'
+config_load() {
+	local file="$1"
+	return 0
+}
 
+config_default_print() {
+	true
+}
 
-cat > debian/rules <<EOF
+gem_get_version() {
+	# echo "$1" | perl  -e 'if ($_ =~ m/.+-([0-9\.]+)(?:\.gem)?/i) { print $1, "\n"; }'
+	echo "$1" | perl -e '$e=<STDIN>; chomp $e; if ($e =~ m/.+-([0-9\.]+)(?:\.gem)?/i) { print $1, "\n"}'
+}
+
+gem_get_name() {
+	# echo "$1" | perl -p -e 's/(.+)-(?:[0-9\.]+)(?:\.gem)?$/$1/gi';
+	echo "$1" | perl -e '$e=<STDIN>; chomp $e; if ($e =~ m/(.+)-(?:\-[0-9\.]+)?(?:\.gem)?/i) { print $1, "\n"} else { print $e, "\n" }'
+}
+
+ruby_dep_name() {
+	# librack-ruby (>= 1.0.1)   ==> rack
+	local str=$(echo "$1" | awk '{print $1}')
+	str=${str// /}
+
+	# not ruby dependency?
+	if ! echo "$str" | grep -q '\-ruby'; then
+		return 1
+	fi
+
+	# remove first "lib"
+	str=${str/lib/}
+
+	# remove -ruby at the end...
+	str=${str/%-ruby/}
+	str=${str/%-ruby1.8/}
+	str=${str/%-ruby1.9/}
+
+	# replace - with _
+	echo "$str" | tr '-' '_'
+}
+
+ruby_dep_version() {
+	# librack-ruby (>= 1.0.1)   ==> 1.0.1
+	local str=$(echo "$1" | awk -F '(' '{print $2}')
+	test -z "$str" && return 1
+	str=${str// /}
+	str=${str//\)/}
+	str=${str//=/}
+	str=${str//</}
+	str=${str//>/}
+	echo "$str"
+}
+
+gem2debpkg() {
+	local gem="$1"
+	test -f "${gem}" || {
+		Error="Invalid gem file: $gem"
+		return 1
+	}
+
+	# get gem deps
+	local deps=$(gemdeps.rb "${gem}")
+
+	if [ "${DO_DEPENDENCIES}" = "1" ]; then
+		local old_ifs="$IFS"
+		# set whitespace separator to newline
+		IFS=$'\n'
+
+		# create dependency debs...
+		local dep_str=""
+		for dep_str in $(echo "${deps}" | tr ',' '\n'); do
+			# echo "got dep_str: '$dep_str'"
+			local dep_lib=$(ruby_dep_name "${dep_str}")
+			test -z "${dep_lib}" && continue
+
+			local dep_version=$(ruby_dep_version "${dep_str}")
+
+			# we should create these too...
+			local dep_gem="${dep_lib}"
+			test ! -z "${dep_version}" && dep_gem="${dep_gem}-${dep_version}"
+
+			# call package_create
+			msg_info "  Building dependency gem package: ${dep_gem}"
+			package_create "${dep_gem}"
+		done
+
+		
+		# restore ifs
+		IFS="${old_ifs}"
+	fi
+
+	# package temporary directory
+	local tmp_dir="${WORKDIR}/$(basename "${gem}")"
+	mkdir -p "${tmp_dir}" || die "Unable to create package temporary directory ${tmp_dir}"
+	
+	# enter it...
+	cd "${tmp_dir}" || die "Unable to enter package temporary directory."
+
+	# unpack gem
+	gem unpack "${gem}" >/dev/null 2>&1 || die "Unable to unpack gem ${gem}"
+
+	# enter gem directory...
+	cd * || die "Unable to enter gem directory."
+	
+	cp /usr/lib/ruby/1.8/setup.rb . || die "Unable to copy setup.rb to package tmpdir."
+	mkdir debian || die "Unable to create debian metadata directory."
+
+	local BD=$( pwd )
+	local VERSION=$( basename $BD | perl -pe 's/^.+-([\d.]+)$/$1/;' )
+	local PACKAGE=$( basename $BD | perl -pe 's/^(.+)-[\d.]+$/$1/;' )
+	gemname=$PACKAGE
+
+	local ARCHITECTURE=""
+	if [ -d "ext" ]; then
+		ARCHITECTURE=any
+	else
+		ARCHITECTURE=all
+	fi
+
+	# we don't want to edit the changelog file after generation
+	# so make /usr/bin/sensible-editor attempt to use /bin/true as the editor
+	EDITOR=/bin/true
+	VISUAL=/bin/true
+	export EDITOR VISUAL
+
+	local pk=$( echo $gemname | tr '_' '-' )
+	PACKAGE="lib$pk-ruby"
+
+	local DEPLIST=""
+
+	if [ -z $DEPENDENCIES ]; then
+		DEPLIST="${deps}"
+	else
+		DEPLIST="${deps}, $DEPENDENCIES"
+	fi
+
+	dch --create "-v$VERSION" -D $DISTRO --package "$PACKAGE" 'initial release' || die "Error running dch"
+
+	# create debian package files...
+	cat > debian/rules <<EOF
 #!/usr/bin/make -f
 
 include /usr/share/cdbs/1/rules/simple-patchsys.mk
@@ -100,9 +237,9 @@ include /usr/share/ruby-pkg-tools/1/class/ruby-setup-rb.mk
 
 $RULES
 EOF
-chmod ugo+rx debian/rules
+	chmod ugo+rx debian/rules
 
-cat > debian/control <<EOF
+	cat > debian/control <<EOF
 Source: $PACKAGE
 Section: libs
 Priority: optional
@@ -132,21 +269,194 @@ Description: documentation for the $PACKAGE ruby gem
  generated rdoc.
 EOF
 
-cat > debian/watch <<EOF
+	cat > debian/watch <<EOF
 # format version number, currently 3; this line is compulsory!
 version=3
 http://rubygems.org/gems/$gemname \
   /downloads/$gemname-([\d\.]+).gem
 EOF
 
+	msg_info "  Building debian package: ${PACKAGE}"
+	if [ "${VERBOSE}" = "1" ]; then
+		dpkg-buildpackage -rfakeroot
+	else
+		dpkg-buildpackage -rfakeroot >/dev/null 2>&1
+	fi
+
+	# time to copy debian packages to $DEB_DIR
+	cp -a ../*.deb "${DEB_DIR}" || die "Unable to copy debian packages to ${DEB_DIR} or no debian packages were created."
+
+	# perform gem cleanup
+	cd "${WORKDIR}" && rm -rf "${tmp_dir}" >/dev/null 2>&1
+	msg_info "Successfully created package ${PACKAGE}, deb files were placed in ${DEB_DIR}."
+
+	return 0
+}
+
+package_create() {
+	local gem="$1"
+	test -z "$gem" && {
+		Error="Undefined gem name."
+		return 1
+	}
+
+	msg_info "Creating package $gem"
+	cd "${WORKDIR}" || die "Unable to enter working directory $WORKDIR."
+
+	local suffix=$(echo "${gem}" | tail -c4)
+	local gem_file=""
+	local gem_name=""
+	local gem_version=""
+
+	# is this filename or remote gem?
+	if [ -f "${gem}" -a "${suffix}" = "gem" ]; then
+		# local gem filename...
+		gem_file="${gem}"
+		gem_name=$(gem_get_name "${gem}")
+		gem_version=$(gem_get_version "${gem}")
+	else
+		mkdir -p "${WORKDIR}/gems" || die "Unable to create gem download directory."
+		cd "${WORKDIR}/gems" || die "Unable to enter gem download directory."
+
+		# fetch gem...
+		gem_version=$(gem_get_version "${gem}")
+		gem=$(gem_get_name "${gem}")
+
+		local gem_fetch_opt=""
+		test ! -z "${gem_version}" && gem_fetch_opt="-v ${gem_version}"
+
+		# try to fetch gem
+		msg_verbose "  Fetching gem: ${gem}, version: ${gem_version}"
+		local gem_tmpf=$(gem fetch "${gem}" ${gem_fetch_opt} 2>/dev/null | awk '{print $2}')
+		gem_tmpf="${WORKDIR}/gems/${gem_tmpf}.gem"
+		# check
+		if [ ! -f "${gem_tmpf}" ]; then
+			Error="Error fetching gem: ${gem} (${gem_tmpf})"
+			return 1
+		fi
+
+		gem_file="${gem_tmpf}"
+		if [ -z "${gem_version}" ]; then
+			gem_version=$(gem_get_version "${gem_file}")
+		fi
+
+		msg_info "  Successfully fetched gem ${gem} version ${gem_version}"
+	fi
+
+	# create package from gem file
+	gem2debpkg "${gem_file}"
+}
+
+run() {
+	test -z "$1" && {
+		Error="No gem names/files provided for conversion. Run $MYNAME --help for instructions."
+		return 1;
+	}
+
+	local name=""
+	for name in $@; do
+		package_create "$name" || return 1
+	done
+}
+
+printhelp() {
+        cat <<EOF
+Usage: $MYNAME [OPTIONS] gem1 gem2 ...
+
+This script generates Debian/Ubuntu compatible package from
+ruby gems.
+
+OPTIONS:
+  -c    --config          Load configuration from specified file
+        --default-config  Prints default configuration file
+
+  -d    --debdir          Store created deb packages in specified directory
+                          (Default: "${DEB_DIR}")
+
+        --with-deps       Create dependency packages
+        --no-cleanup      Don't remove working directories
+
+  -v    --verbose         Verbose execution
+  -D    --debug           Enables script debugging.
+  -V    --version         Prints script version and exits.
+  -h    --help            This help message.
+
+EXAMPLES:
+
+# create mongo_rack and place packages to ${DEB_DIR}:
+$MYNAME mongo_rack
+
+# create mongo_rack version 0.0.5 with all dependencies and place packages
+# to /export/debian/packages
+$MYNAME -d /export/debian/packages --with-deps mongo_rack-0.0.5
+EOF
+}
+
+#############################################
+#                  MAIN                     #
+#############################################
+
+# parse command line
+TEMP=`getopt -o c:d:DvVh --long config:,default-config:,debdir:,with-deps,no-cleanup,debug,verbose,version,help -n "$MYNAME" -- "$@"`
+eval set -- "$TEMP"
+while true; do
+	case $1 in
+		-c|--config)
+			config_load "$2" || die "$Error"
+			shift 2
+			;;
+		--default-config)
+			config_default_print
+			exit 0
+			;;
+		-d|--debdir)
+			DEB_DIR="$2"
+			shift 2
+			;;
+		--with-deps)
+			DO_DEPENDENCIES=1
+			shift
+			;;
+		--no-cleanup)
+			NO_CLEANUP="1"
+			shift
+			;;
+		-D|--debug)
+			set -x
+			shift
+			;;
+		-v|--verbose)
+			VERBOSE=1
+			shift
+			;;
+		-V|--version)
+			printf "%s %-.2f\n" "$MYNAME" "$VERSION"
+			exit 0
+			;;
+		-h|--help)
+			printhelp
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		*)
+			die "Command line parsing error: $1"
+			;;
+	esac
+done
+
+# initialize script
+script_init
 
 
-dpkg-buildpackage -rfakeroot
+# do it
+run "$@" || die "$Error"
 
-cd $origpath
-mkdir -p $PACKAGE
-cp $WORKDIR/$PACKAGE* $PACKAGE/
-ls -l $PACKAGE/*
+# perform cleanup
+do_cleanup
 
-rm -rf $WORKDIR
+exit 0
 
+# This is it, folx!
